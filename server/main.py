@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -80,6 +81,7 @@ class Order(BaseModel):
     actual_delivery: Optional[str] = None
     warehouse: Optional[str] = None
     category: Optional[str] = None
+    lead_time_days: Optional[int] = None
 
 class DemandForecast(BaseModel):
     id: str
@@ -89,6 +91,8 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: Optional[float] = None
+    lead_time_days: Optional[int] = None
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +123,16 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+    lead_time_days: int
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockOrderItem]
 
 # API endpoints
 @app.get("/")
@@ -165,6 +179,111 @@ def get_order(order_id: str):
 def get_demand_forecasts():
     """Get demand forecasts"""
     return demand_forecasts
+
+@app.get("/api/restocking/recommendations")
+def get_restocking_recommendations(budget: float = 0):
+    """Recommend demand-forecast items to restock within a given budget.
+
+    Strategy (gap x trend, greedy fill):
+    - gap = max(forecasted_demand - current_demand, 0); items with no gap are skipped.
+    - Prioritize 'increasing' trend items first, then by full gap line cost descending.
+    - Greedily add as many units of each item as the remaining budget allows (up to the gap).
+    """
+    # Build candidate list with computed gaps and full gap line cost
+    candidates = []
+    max_budget = 0.0
+    for item in demand_forecasts:
+        gap = max(item.get('forecasted_demand', 0) - item.get('current_demand', 0), 0)
+        unit_cost = item.get('unit_cost') or 0
+        if gap <= 0 or unit_cost <= 0:
+            continue
+        full_line_cost = gap * unit_cost
+        max_budget += full_line_cost
+        candidates.append({
+            'sku': item['item_sku'],
+            'name': item['item_name'],
+            'trend': item.get('trend', 'stable'),
+            'gap': gap,
+            'unit_cost': unit_cost,
+            'lead_time_days': item.get('lead_time_days', 0),
+            'full_line_cost': full_line_cost,
+        })
+
+    # Priority: increasing trend first, then largest gap line cost first
+    candidates.sort(key=lambda c: (c['trend'] != 'increasing', -c['full_line_cost']))
+
+    recommendations = []
+    remaining = budget
+    total_cost = 0.0
+    for c in candidates:
+        affordable_qty = int(remaining // c['unit_cost'])
+        qty = min(c['gap'], affordable_qty)
+        if qty <= 0:
+            continue
+        line_total = round(qty * c['unit_cost'], 2)
+        recommendations.append({
+            'sku': c['sku'],
+            'name': c['name'],
+            'trend': c['trend'],
+            'quantity': qty,
+            'unit_cost': c['unit_cost'],
+            'line_total': line_total,
+            'lead_time_days': c['lead_time_days'],
+        })
+        remaining -= line_total
+        total_cost += line_total
+
+    return {
+        'recommendations': recommendations,
+        'total_cost': round(total_cost, 2),
+        'max_budget': round(max_budget, 2),
+    }
+
+@app.post("/api/restocking/orders", response_model=Order, status_code=201)
+def create_restocking_order(request: CreateRestockOrderRequest):
+    """Submit a restocking order. Appends a 'Submitted' order to the in-memory orders list."""
+    if not request.items:
+        raise HTTPException(status_code=400, detail="At least one item is required")
+
+    # Generate next sequential restock order number (RST-YYYY-####)
+    restock_count = len([o for o in orders if o.get('order_number', '').startswith('RST-')])
+    order_year = datetime.now().year
+    order_number = f"RST-{order_year}-{restock_count + 1:04d}"
+
+    order_date = datetime.now()
+    max_lead_time = max(item.lead_time_days for item in request.items)
+    expected_delivery = order_date + timedelta(days=max_lead_time)
+
+    items = []
+    total_value = 0.0
+    for item in request.items:
+        line_total = item.quantity * item.unit_cost
+        total_value += line_total
+        items.append({
+            'sku': item.sku,
+            'name': item.name,
+            'quantity': item.quantity,
+            'unit_price': item.unit_cost,
+            'lead_time_days': item.lead_time_days,
+        })
+
+    new_order = {
+        'id': f"restock-{restock_count + 1}",
+        'order_number': order_number,
+        'customer': 'Internal Restock',
+        'items': items,
+        'status': 'Submitted',
+        'order_date': order_date.strftime('%Y-%m-%d'),
+        'expected_delivery': expected_delivery.strftime('%Y-%m-%d'),
+        'total_value': round(total_value, 2),
+        'actual_delivery': None,
+        'warehouse': None,
+        'category': None,
+        'lead_time_days': max_lead_time,
+    }
+
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/backlog", response_model=List[BacklogItem])
 def get_backlog():
